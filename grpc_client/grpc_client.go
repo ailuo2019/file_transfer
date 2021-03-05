@@ -41,15 +41,16 @@ func must(err error) {
 	fmt.Printf("ERROR: %+v\n", err)
 	os.Exit(1)
 }
-
+var totalSize int64 = 0
 type ClientGRPCConfig struct {
 	Address         string
 	ChunkSize       int
 	RootCertificate string
 	Compress        bool
+	conn      *grpc.ClientConn
 }
 
-func NewClientGRPC(cfg ClientGRPCConfig) (c ClientGRPC, err error) {
+func (cfg *ClientGRPCConfig) connect() (err error) {
 	var (
 		grpcOpts  = []grpc.DialOption{}
 		grpcCreds credentials.TransportCredentials
@@ -79,36 +80,34 @@ func NewClientGRPC(cfg ClientGRPCConfig) (c ClientGRPC, err error) {
 		grpcOpts = append(grpcOpts, grpc.WithInsecure())
 	}
 
-	switch {
-	case cfg.ChunkSize == 0:
-		err = errors.Errorf("ChunkSize must be specified")
-		return
-	case cfg.ChunkSize > (1 << 22):
-		err = errors.Errorf("ChunkSize must be < than 4MB")
-		return
-	default:
-		c.chunkSize = cfg.ChunkSize
-	}
-
-	c.logger = zerolog.New(os.Stdout).
-		With().
-		Str("from", "client").
-		Logger()
-
-	c.conn, err = grpc.Dial(cfg.Address, grpcOpts...)
+	cfg.conn, err = grpc.Dial(cfg.Address, grpcOpts...)
 	if err != nil {
 		err = errors.Wrapf(err,
 			"failed to start grpc connection with address %s",
 			cfg.Address)
 		return
-	}
-
-	c.client = messaging.NewGuploadServiceClient(c.conn)
-
+	}	
 	return
 }
 
-func (c *ClientGRPC) UploadFile(ctx context.Context, f string) (stats Stats, err error) {
+func (c *ClientGRPCConfig) Close() {
+	if c.conn != nil {
+		c.conn.Close()
+	}
+}
+
+func NewClientGRPC(cfg ClientGRPCConfig) (c ClientGRPC) {
+	c.chunkSize = cfg.ChunkSize
+	c.logger = zerolog.New(os.Stdout).
+		With().
+		Str("from", "client").
+		Logger()
+	c.conn = cfg.conn
+	c.client = messaging.NewGuploadServiceClient(c.conn)
+	return
+}
+
+func (c *ClientGRPC) UploadFile(ctx context.Context, f string) (err error) {
 	var (
 		writing = true
 		buf     []byte
@@ -124,6 +123,10 @@ func (c *ClientGRPC) UploadFile(ctx context.Context, f string) (stats Stats, err
 			f)
 		return
 	}
+	fi,_ := file.Stat()
+	fmt.Printf("The file is %d bytes long\n", fi.Size())
+	totalSize += int64(fi.Size())
+
 	defer file.Close()
 	subStr := strings.Split(f, "/")
 	fileName := subStr[len(subStr)-1]
@@ -137,7 +140,6 @@ func (c *ClientGRPC) UploadFile(ctx context.Context, f string) (stats Stats, err
 	}
 	defer stream.CloseSend()
 
-	stats.StartedAt = time.Now()
 	buf = make([]byte, c.chunkSize)
 	for writing {
 		n, err = file.Read(buf)
@@ -165,8 +167,6 @@ func (c *ClientGRPC) UploadFile(ctx context.Context, f string) (stats Stats, err
 		}
 	}
 
-	stats.FinishedAt = time.Now()
-
 	status, err = stream.CloseAndRecv()
 	if err != nil {
 		err = errors.Wrapf(err,
@@ -184,38 +184,50 @@ func (c *ClientGRPC) UploadFile(ctx context.Context, f string) (stats Stats, err
 	return
 }
 
-func (c *ClientGRPC) Close() {
-	if c.conn != nil {
-		c.conn.Close()
-	}
-}
+
 
 func main() {
+	var err error
+    chunkSizePtr := flag.Int("chunk-size", (1<<12), "size of the chunk messages")
+    timePtr := flag.Int("time", 1, "the time of repeating uploading the same file")
+    addressPtr := flag.String("address", "localhost:1313", "path to TLS certificate")
+    filePtr := flag.String("file", "", "file to upload")
+    //example of default certificate: ./certs/selfsigned.cert
+    //certPtr := flag.String("certificate", "", "path of a certificate to add to the root CAs")
+    //compressPtr := flag.Bool("compress", false, "whether or not to enable payload compression")
 
-	chunkSizePtr := flag.Int("chunk-size", (1<<12), "size of the chunk messages")
-	addressPtr := flag.String("address", "localhost:1313", "path to TLS certificate")
-	filePtr := flag.String("file", "", "file to upload")
-	//example of default certificate: ./certs/selfsigned.cert
-	//certPtr := flag.String("certificate", "", "path of a certificate to add to the root CAs")
-	//compressPtr := flag.Bool("compress", false, "whether or not to enable payload compression")
+    flag.Parse()
+    cfg := ClientGRPCConfig{}
 
-	flag.Parse()
-	cfg := ClientGRPCConfig{}
-
-	cfg.Address = *addressPtr
-	cfg.ChunkSize = *chunkSizePtr
-	file := *filePtr
-	if file == "" {
-		must(errors.New("file must be set"))
-	}
-	//cfg.RootCertificate = *certPtr
-	//cfg.Compress = *compressPtr
-
-	grpcClient, err := NewClientGRPC(cfg)
-	must(err)		
-	stat, err := grpcClient.UploadFile(context.Background(), file)
-	must(err)
-	defer grpcClient.Close()
-	fmt.Printf("gRPC upload file time %d ns\n", stat.FinishedAt.Sub(stat.StartedAt).Nanoseconds())
-	return
+    cfg.Address = *addressPtr
+    cfg.ChunkSize = *chunkSizePtr
+    file := *filePtr
+    if file == "" {
+            must(errors.New("file must be set"))
+    }
+    //cfg.RootCertificate = *certPtr
+    //cfg.Compress = *compressPtr
+    var totalTimeStats Stats
+    var loopTime Stats
+    totalTimeStats.StartedAt = time.Now()
+    err = cfg.connect();
+    must(err)
+    times := *timePtr
+    var totalLoopTime int64 = 0
+    for i := 0; i < times; i++ {
+	    //time.Sleep(800 * time.Millisecond)
+ 	    loopTime.StartedAt = time.Now()
+	    grpcClient := NewClientGRPC(cfg)
+	    err = grpcClient.UploadFile(context.Background(), file)
+	    loopTime.FinishedAt = time.Now()
+	    totalLoopTime = totalLoopTime + loopTime.FinishedAt.Sub(loopTime.StartedAt).Microseconds()
+	    fmt.Printf("average speed: %d Mbps\n", totalSize*8/totalLoopTime)
+        must(err)
+    }
+    
+    cfg.Close()
+    totalTimeStats.FinishedAt = time.Now()
+    totalLoopTime = (totalTimeStats.FinishedAt.Sub(totalTimeStats.StartedAt).Microseconds())
+    fmt.Printf("average upload time ms %d\n", totalLoopTime/int64(times))
+    return
 }
